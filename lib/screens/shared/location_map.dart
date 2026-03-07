@@ -15,6 +15,22 @@ import '../../themes/app_themes.dart';
 import '../../widgets/map/map_ui_overlays.dart';
 import '../../widgets/map/marker_factory.dart';
 
+// --- Isolate Parsing Helpers ---
+Future<List<PolygonGeometry>> _parseLayerIsolate(
+  Map<String, String> args,
+) async {
+  return GeoJsonParser.parseLayerGeoJson(args['text']!, args['layerId']!);
+}
+
+List<MetroLine> _parseMetroLinesIsolate(String text) {
+  return GeoJsonParser.parseMetroLines(jsonDecode(text));
+}
+
+List<MetroStation> _parseMetroStationsIsolate(String text) {
+  return GeoJsonParser.parseMetroStations(jsonDecode(text));
+}
+// -------------------------------
+
 class LocationMap extends StatefulWidget {
   final LatLng? currentLocation;
   final LatLng? seekerLocation;
@@ -97,6 +113,20 @@ class _LocationMapState extends State<LocationMap> {
   double? _nearestDistanceMeters;
   double _metroRadiusMeters = 700.0;
 
+  // --- Render Caches ---
+  ThemeData? _lastTheme;
+  bool _staticMarkersDirty = true;
+  bool _metroObjectsDirty = true;
+  bool _polygonsDirty = true;
+
+  List<Marker> _cachedStaticMarkers = [];
+  List<Marker> _cachedMetroMarkers = [];
+  List<CircleMarker> _cachedMetroStationCircles = [];
+  List<CircleMarker> _cachedMetroRadiusCircles = [];
+  List<Polyline> _cachedMetroLinePolylines = [];
+  List<Polygon> _cachedPolygons = [];
+  bool? _lastShowLabels;
+
   @override
   void initState() {
     super.initState();
@@ -113,6 +143,7 @@ class _LocationMapState extends State<LocationMap> {
     if (radius != null && mounted) {
       setState(() {
         _metroRadiusMeters = radius;
+        _metroObjectsDirty = true; // Update radius circles
       });
     }
   }
@@ -155,6 +186,9 @@ class _LocationMapState extends State<LocationMap> {
 
     final zoomDelta = (_currentZoom - nextZoom).abs();
     final rotationDelta = (_currentRotation - nextRotation).abs();
+
+    // Only trigger setState if zoom delta > 0.1, rotation delta > 0.1
+    // OR if label visibility crosses a threshold.
     if (zoomDelta < 0.1 &&
         currentLayerLabelVisible == nextLayerLabelVisible &&
         rotationDelta < 0.1) {
@@ -201,6 +235,7 @@ class _LocationMapState extends State<LocationMap> {
         if (layerId == 'toggle_landmarks') {
           _showLandmarks = !_showLandmarks;
         }
+        _staticMarkersDirty = true;
       });
       return;
     }
@@ -212,6 +247,7 @@ class _LocationMapState extends State<LocationMap> {
       setState(() {
         _selectedLayerId = null;
         _layerError = null;
+        _polygonsDirty = true;
       });
       return;
     }
@@ -229,6 +265,7 @@ class _LocationMapState extends State<LocationMap> {
       setState(() {
         _selectedLayerId = layer.id;
         _layerError = null;
+        _polygonsDirty = true;
       });
       return;
     }
@@ -238,18 +275,21 @@ class _LocationMapState extends State<LocationMap> {
       _isLoadingLayer = true;
       _layerError = null;
       _selectedLayerId = layer.id;
+      _polygonsDirty = true;
     });
 
     try {
       final geoJsonText = await rootBundle.loadString(layer.assetPath);
-      final geometries = await GeoJsonParser.parseLayerGeoJson(
-        geoJsonText,
-        layer.id,
-      );
+      final geometries = await compute(_parseLayerIsolate, {
+        'text': geoJsonText,
+        'layerId': layer.id,
+      });
+
       if (!mounted) return;
       setState(() {
         _layerGeometryCache[layer.id] = geometries;
         _layerError = null;
+        _polygonsDirty = true;
       });
     } catch (error, stackTrace) {
       if (kDebugMode) {
@@ -261,6 +301,7 @@ class _LocationMapState extends State<LocationMap> {
       setState(() {
         _selectedLayerId = previousLayerId;
         _layerError = _describeLayerLoadError(layer, error);
+        _polygonsDirty = true;
       });
     } finally {
       if (mounted) {
@@ -284,15 +325,17 @@ class _LocationMapState extends State<LocationMap> {
         'assets/metro/bengaluru_metro_stations.geojson',
       );
 
-      final parsedLines = GeoJsonParser.parseMetroLines(jsonDecode(linesText));
-      final parsedStations = GeoJsonParser.parseMetroStations(
-        jsonDecode(stationsText),
+      final parsedLines = await compute(_parseMetroLinesIsolate, linesText);
+      final parsedStations = await compute(
+        _parseMetroStationsIsolate,
+        stationsText,
       );
 
       if (mounted) {
         setState(() {
           _metroLines = parsedLines;
           _metroStations = parsedStations;
+          _metroObjectsDirty = true;
         });
         _updateNearestStation();
       }
@@ -464,9 +507,18 @@ class _LocationMapState extends State<LocationMap> {
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final textTheme = Theme.of(context).textTheme;
-    final brightness = Theme.of(context).brightness;
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final textTheme = theme.textTheme;
+    final brightness = theme.brightness;
+
+    // Invalidate caches if theme changes
+    if (_lastTheme != theme) {
+      _staticMarkersDirty = true;
+      _metroObjectsDirty = true;
+      _polygonsDirty = true;
+      _lastTheme = theme;
+    }
 
     if (widget.currentLocation == null) {
       return LocationPlaceholder(
@@ -476,93 +528,124 @@ class _LocationMapState extends State<LocationMap> {
       );
     }
 
-    final mapPolygons = _buildLayerPolygons(colorScheme, textTheme);
-    final metroLinePolylines = _buildMetroLines();
+    // Process Polygons (Cached)
+    final currentShowLabels = _selectedLayerId != null
+        ? _shouldShowLabelsForLayer(_selectedLayerId!, _currentZoom)
+        : false;
 
-    final showMetroMarkers = _currentZoom >= _metroLabelMinZoom;
-    final showMetroDots =
-        _currentZoom >= _metroStationDotMinZoom && !showMetroMarkers;
+    if (_polygonsDirty || _lastShowLabels != currentShowLabels) {
+      _cachedPolygons = _buildLayerPolygons(colorScheme, textTheme);
+      _polygonsDirty = false;
+      _lastShowLabels = currentShowLabels;
+    }
 
-    final metroStationCircles = !showMetroDots
-        ? const <CircleMarker>[]
-        : _metroStations
-              .map(
-                (station) => CircleMarker(
-                  point: station.location,
-                  color: _lineColorFor(station.line),
-                  radius: 6,
-                  borderColor: Colors.white,
-                  borderStrokeWidth: 1,
-                ),
-              )
-              .toList(growable: false);
+    // Process Metro Objects (Cached)
+    if (_metroObjectsDirty) {
+      _cachedMetroLinePolylines = _buildMetroLines();
 
-    final showMetroRadius = _currentZoom >= _metroRadiusMinZoom;
-    final metroRadiusCircles = !showMetroRadius
-        ? const <CircleMarker>[]
-        : _metroStations
-              .map(
-                (station) => CircleMarker(
-                  point: station.location,
-                  color: Colors.transparent,
-                  radius: _metroRadiusMeters,
-                  useRadiusInMeter: true,
-                  borderColor: _lineColorFor(
-                    station.line,
-                  ).withValues(alpha: 0.3),
-                  borderStrokeWidth: 2,
-                ),
-              )
-              .toList(growable: false);
+      _cachedMetroStationCircles = _metroStations
+          .map(
+            (station) => CircleMarker(
+              point: station.location,
+              color: _lineColorFor(station.line),
+              radius: 6,
+              borderColor: Colors.white,
+              borderStrokeWidth: 1,
+            ),
+          )
+          .toList(growable: false);
 
-    final allCircles = [...metroRadiusCircles, ...metroStationCircles];
+      _cachedMetroRadiusCircles = _metroStations
+          .map(
+            (station) => CircleMarker(
+              point: station.location,
+              color: Colors.transparent,
+              radius: _metroRadiusMeters,
+              useRadiusInMeter: true,
+              borderColor: _lineColorFor(station.line).withValues(alpha: 0.3),
+              borderStrokeWidth: 2,
+            ),
+          )
+          .toList(growable: false);
 
-    final markers = [
-      ...MarkerFactory.buildMetroMarkers(
+      _cachedMetroMarkers = MarkerFactory.buildMetroMarkers(
         _metroStations,
         _metroLines,
-        _currentZoom,
-        _metroLabelMinZoom,
+        100.0, // Force build all markers regardless of zoom
+        0.0,
         _lineColorFor,
         colorScheme,
         textTheme,
-      ),
-      ...MarkerFactory.buildRailwayMarkers(
-        StaticMapData.kRailwayStations,
-        _showRailwayStations,
-        colorScheme,
-        textTheme,
-      ),
-      ...MarkerFactory.buildBusStopMarkers(
-        StaticMapData.kBusStops,
-        _showBusStops,
-        colorScheme,
-        textTheme,
-      ),
-      ...MarkerFactory.buildLakeMarkers(
-        StaticMapData.kLakes,
-        _showLakes,
-        colorScheme,
-        textTheme,
-      ),
-      ...MarkerFactory.buildMeghanaMarkers(
-        StaticMapData.kMeghanaLocations,
-        _showMeghanaFoods,
-        colorScheme,
-        textTheme,
-      ),
-      ...MarkerFactory.buildMallMarkers(
-        StaticMapData.kMalls,
-        _showMalls,
-        colorScheme,
-        textTheme,
-      ),
-      ...MarkerFactory.buildLandmarkMarkers(
-        StaticMapData.kLandmarks,
-        _showLandmarks,
-        colorScheme,
-        textTheme,
-      ),
+      );
+
+      _metroObjectsDirty = false;
+    }
+
+    // Process Static Markers (Cached)
+    if (_staticMarkersDirty) {
+      _cachedStaticMarkers = [
+        ...MarkerFactory.buildRailwayMarkers(
+          StaticMapData.kRailwayStations,
+          _showRailwayStations,
+          colorScheme,
+          textTheme,
+        ),
+        ...MarkerFactory.buildBusStopMarkers(
+          StaticMapData.kBusStops,
+          _showBusStops,
+          colorScheme,
+          textTheme,
+        ),
+        ...MarkerFactory.buildLakeMarkers(
+          StaticMapData.kLakes,
+          _showLakes,
+          colorScheme,
+          textTheme,
+        ),
+        ...MarkerFactory.buildMeghanaMarkers(
+          StaticMapData.kMeghanaLocations,
+          _showMeghanaFoods,
+          colorScheme,
+          textTheme,
+        ),
+        ...MarkerFactory.buildMallMarkers(
+          StaticMapData.kMalls,
+          _showMalls,
+          colorScheme,
+          textTheme,
+        ),
+        ...MarkerFactory.buildLandmarkMarkers(
+          StaticMapData.kLandmarks,
+          _showLandmarks,
+          colorScheme,
+          textTheme,
+        ),
+      ];
+      _staticMarkersDirty = false;
+    }
+
+    // Compute visibility for map elements based on current zoom
+    final showMetroMarkers = _currentZoom >= _metroLabelMinZoom;
+    final showMetroDots =
+        _currentZoom >= _metroStationDotMinZoom && !showMetroMarkers;
+    final showMetroRadius = _currentZoom >= _metroRadiusMinZoom;
+
+    final metroStationCircles = showMetroDots
+        ? _cachedMetroStationCircles
+        : const <CircleMarker>[];
+    final metroRadiusCircles = showMetroRadius
+        ? _cachedMetroRadiusCircles
+        : const <CircleMarker>[];
+    final allCircles = [...metroRadiusCircles, ...metroStationCircles];
+
+    final finalMetroMarkers = showMetroMarkers
+        ? _cachedMetroMarkers
+        : const <Marker>[];
+
+    // Build the final dynamically updated markers list
+    final markers = [
+      ...finalMetroMarkers,
+      ..._cachedStaticMarkers,
       if (widget.seekerLocation != null)
         _buildUserMarker(
           widget.seekerLocation!,
@@ -619,12 +702,12 @@ class _LocationMapState extends State<LocationMap> {
                                 ),
                           ),
                         ),
-                        if (metroLinePolylines.isNotEmpty)
-                          PolylineLayer(polylines: metroLinePolylines),
+                        if (_cachedMetroLinePolylines.isNotEmpty)
+                          PolylineLayer(polylines: _cachedMetroLinePolylines),
                         if (allCircles.isNotEmpty)
                           CircleLayer(circles: allCircles),
-                        if (mapPolygons.isNotEmpty)
-                          PolygonLayer(polygons: mapPolygons),
+                        if (_cachedPolygons.isNotEmpty)
+                          PolygonLayer(polygons: _cachedPolygons),
                         MarkerLayer(markers: markers),
                       ],
                     ),
