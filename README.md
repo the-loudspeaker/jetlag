@@ -61,7 +61,7 @@ Artifacts are kept for the last 5 runs.
 This project is licensed under the **GNU General Public License v3.0 (GPLv3)**. See the [LICENSE](LICENSE) file for details.
 
 ## TODO 
+- Balance the deck & print it.
 - Do a trial run.
-- Plan questions & curses after it.
-- Consider adding in-app question & curse management.
-- Start making a map using some tool online that can be printed for offline use.
+- Add bottom nav bar layout for Matching, Measuring & Photos type questions & views. 
+- Temperature & Radar will be done manually.
